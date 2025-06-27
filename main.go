@@ -3,7 +3,8 @@ package main
 import (
 	"crypto/sha1"
 	"encoding/base64"
-	"fmt"
+	_ "fmt"
+	"log"
 	"os"
 	"os/exec"
 	"regexp"
@@ -16,18 +17,13 @@ import (
 
 type Keys map[string] string
 
-func log(s... any){
-	s = append([]any{Names.program + ":"}, s...)
-	fmt.Println(s...)
-}
-
 func hasCapabilities() bool{
 	o, e := unix.PrctlRetInt(unix.PR_CAPBSET_READ, unix.CAP_SYS_ADMIN, 0, 0, 0)
 	if o != 1 {
 		return false
 	}
 	if e != nil {
-		log(e)
+		logErr(e)
 		panic(e)
 	}
 	o, e = unix.PrctlRetInt(unix.PR_CAP_AMBIENT, unix.PR_CAP_AMBIENT_IS_SET, unix.CAP_SYS_ADMIN, 0, 0)
@@ -35,14 +31,14 @@ func hasCapabilities() bool{
 		return false
 	}
 	if e != nil {
-		log(e)
+		logErr(e)
 		panic(e)
 	}
 	return true
 }
 
 func enterNamespace(unshareFlags int){
-	log("entering new namespace")
+	logInfo("entering new namespace")
 	cmd := exec.Command(os.Args[0], os.Args[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -51,22 +47,23 @@ func enterNamespace(unshareFlags int){
 		Unshareflags: uintptr(unshareFlags),
 		UidMappings: []syscall.SysProcIDMap {
 			{
+				// going with root uid method for now because implementing `unshare -c --keep-caps` looks awful
 				ContainerID: 0,
-				HostID: unix.Getuid(),
+				HostID: syscall.Getuid(),
 				Size: 1,
 			},
 		},
 		GidMappings: []syscall.SysProcIDMap {
 			{
 				ContainerID: 0,
-				HostID: unix.Getuid(),
+				HostID: syscall.Getuid(),
 				Size: 1,
 			},
 		},
 	}
-	e := cmd.Start()
-	if e != nil {
-		log(e)
+	err := cmd.Start()
+	if err != nil {
+		logErr(err)
 	}
 }
 
@@ -96,12 +93,11 @@ func makeNextIndex(keys Keys) (string, error) {
 		}
 		break
 	}
-	log("next index:", i)
+	logInfo("next index:", i)
 
 	// create index
 	iStr := strconv.FormatUint(i, 10)
 	index := Config.storage + "/" + iStr
-	log(index)
 	err = os.MkdirAll(index + "/data", 0755)
 	if err != nil {
 		return "", err
@@ -129,7 +125,7 @@ func makeNextIndex(keys Keys) (string, error) {
 func getIndex(keys Keys) (string, bool) {
 	entries, err := os.ReadDir(Config.storage)
 	if err != nil {
-		log(err)
+		logErr(err)
 	}
 
 	for _, index := range entries {
@@ -149,7 +145,7 @@ func getIndex(keys Keys) (string, bool) {
 func parseId(id string, keys Keys) bool {
 	keyvalues, err := os.ReadFile(id)
 	if err != nil {
-		log(err)
+		logErr(err)
 		return false
 	}
 	value := ""
@@ -157,14 +153,14 @@ func parseId(id string, keys Keys) bool {
 	for i,ii := 0,0; i<len(keyvalues)-1; i++ {
 		if keyvalues[i] == '\000' && keyvalues[i+1] == '\n' {
 			line := string(keyvalues[ii:i])
-			log("line:", line)
+			// log("line:", line)
 			if n % 2 == 0 { // line is a key
-				log("key")
+				// log("key")
 				value = keys[line]
 			} else { // line is a value
-				log("value")
+				// log("value")
 				if value != line {
-					log("value issue")
+					// log("value issue")
 					return false
 				}
 			}
@@ -175,7 +171,7 @@ func parseId(id string, keys Keys) bool {
 	}
 
 	if n/2 != len(keys) {
-		log("numbah issue", n, len(keys), keys)
+		// log("numbah issue", n, len(keys), keys)
 		return false
 	}
 
@@ -185,31 +181,51 @@ func parseId(id string, keys Keys) bool {
 func mount(src, targ, fstype string, flags uintptr, data string) {
 	err := syscall.Mount(src, targ, fstype, flags, data)
 	if err != nil {
-		log(err)
+		logErr(err)
 		panic("mount failure")
 	}
 	if fstype != "" {
 		Config.mounts = append(Config.mounts, targ)
-		log("mounted", fstype, "on", targ)
+		logInfo("mounted", fstype, "on", targ)
 	}
 }
 
-func treeAdd(source, sink, index string) error {
+func escapeOverlayOpts(s string) string {
+	in := []byte(s)
+	var out []byte
+	for _, v := range in {
+		switch v {
+		case '\\', ',', ':':
+			out = append(out, '\\', v)
+		default:
+			out = append(out, v)
+		}
+	}
+	return string(out)
+}
+
+func treeAdd(source, sink, index string) {
 	args := []string{
+		// lower
 		source,
 		strings.Join([]string{Config.tree, Names.lower, sink}, "/"),
+		// upper
 		strings.Join([]string{Config.storage, index, Names.data}, "/"),
 		strings.Join([]string{Config.tree, Names.upper, sink}, "/"),
+		// overlay
+		sink,
+		strings.Join([]string{Config.tree, Names.overlay, sink}, "/"),
 	}
 	for i:=0; i<len(args); i+=2 {
+		os.MkdirAll(args[i+1], 0755)
 		mount(args[i], args[i+1], "bind", syscall.MS_BIND, "")
 	}
 
-	log("tree added")
-	return nil
+	logInfo("tree added")
 }
 
-func placer(source, sink string, keys Keys) error {
+func place(source, sink string, keys Keys) error {
+	logInfo("place:", source, sink, keys)
 	var err error
 	index, success := getIndex(keys)
 	if ! success {
@@ -219,7 +235,15 @@ func placer(source, sink string, keys Keys) error {
 		}
 	}
 
+	indexPath := escapeOverlayOpts(Config.storage) + "/" + index
+	data :=
+		"lowerdir=" + escapeOverlayOpts(source) +
+		",upperdir=" + indexPath + "/" + Names.data +
+		",workdir=" + indexPath + "/" + Names.work +
+		"," + Config.overlayOpts
+	mount("a", "b", "overlay", 0, data)
 	treeAdd(source, sink, index)
+
 	return nil
 }
 
@@ -242,7 +266,7 @@ func makeStorage() (string, error) {
 			if err != nil {
 				return "", err
 			}
-			log("made storage", out)
+			logInfo("made storage", out)
 		} else {
 			return "", err // error reading
 		}
@@ -250,10 +274,44 @@ func makeStorage() (string, error) {
 	return out, nil
 }
 
+func ioParse(args Place, flag string) Keys {
+	type opts uint8
+	const (
+		IN opts = 1 << iota
+		OUT
+	)
+	var o opts
+	out := make(Keys)
+	i := strings.IndexByte(flag, ',')
+	if i < 0 {
+		if args.sink == args.source { // defaults
+			o = IN | OUT
+		} else {
+			o = OUT
+		}
+	} else {
+		s := flag[i+1:]
+		if strings.Contains(s, "i") {
+			o |= IN
+		}
+		if strings.Contains(s, "o") {
+			o |= OUT
+		}
+	}
+	if o & IN == IN {
+		out["source"] = args.source
+	}
+	if o & OUT == OUT {
+		out["sink"] = args.sink
+	}
+	return out
+}
+
 var Names = struct{
 	program string
 	id string
 	data string
+	work string
 	upper string
 	lower string
 	overlay string
@@ -263,6 +321,7 @@ var Names = struct{
 	"overlayer",
 	"id",
 	"data",
+	"work",
 	"upper",
 	"lower",
 	"overlay",
@@ -270,25 +329,36 @@ var Names = struct{
 	"by-cwd",
 }
 
+type Place struct  {
+	source string
+	sink string
+	keys Keys
+}
+
 var Config struct {
 	global string
 	storage string
 	tree string
-	place [][]string
+	place []Place
 	mounts []string
+	overlayOpts string
 }
+
+var logInfo = log.New(os.Stderr, Names.program + ": ", 0).Println
+var logErr = log.New(os.Stderr, Names.program + "[error]: ", log.Lshortfile).Println
 
 func main(){
 	// in the future try to detect who owns the current mount namespace as well
-	log(unix.Getuid())
-	if (unix.Getuid() != 0) && ! hasCapabilities() {
+	if (syscall.Getuid() != 0) && ! hasCapabilities() {
 		enterNamespace(syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS)
 		return
 	}
 
 	// flag parsing!!!!!!!
+	var argKeys = make(Keys)
 	for i:=1; i<len(os.Args); i++ {
-		switch os.Args[i] {
+		flag := os.Args[i]
+		switch flag {
 		case "-g", "-global":
 			Config.global = os.Args[i+1]
 			i++
@@ -298,32 +368,37 @@ func main(){
 		case "-t", "-tree":
 			Config.storage = os.Args[i+1]
 			i++
-		case "-p", "-place":
-			args := []string{ os.Args[i+1], os.Args[i+2] }
-			Config.place = append(Config.place, args)
+		case "-k", "-key":
+			argKeys[os.Args[i+1]] = os.Args[i+2]
 			i+=2
-		case "-r", "-replace":
-			args := []string{ os.Args[i+1] }
-			Config.place = append(Config.place, args)
-			i++
-		case "parse":
-			out := parseId(os.Args[i+1], Keys{"a": "b"})
-			log(out)
-			i++
-		case "write":
-			makeNextIndex(Keys{"a": "b"})
-		case "get":
-			log(getIndex(Keys{"a": "b"}))
 		case "--":
+			i++
 			goto exit
 		default:
+			b, _ := regexp.MatchString(`^(-p(|lace)|-r(|eplace))(|,[io]{1,2})$`, flag)
+			if b {
+				var args Place
+				if strings.HasPrefix(flag, "-r") {
+					args.source = os.Args[i+1]
+					args.sink = args.source
+					i++
+				} else {
+					args.source = os.Args[i+1]
+					args.sink = os.Args[i+2]
+					i+=2
+				}
+				if len(argKeys) > 0 {
+					args.keys = argKeys
+				} else {
+					args.keys = ioParse(args, flag)
+				}
+				Config.place = append(Config.place, args)
+				continue
+			}
 			goto exit
 		}
 	}
 	exit:
-	for _, v := range Config.place {
-		log(len(v), v)
-	}
 
 	// defaults
 	if Config.global == "" {
@@ -331,7 +406,7 @@ func main(){
 		if ! b {
 			xdgDataHome, b = os.LookupEnv("HOME")
 			if ! b {
-				log("no HOME??????")
+				logErr("no HOME??????")
 				return
 			}
 			xdgDataHome = xdgDataHome + "/.local/share"
@@ -343,13 +418,13 @@ func main(){
 		var err error
 		Config.storage, err = makeStorage()
 		if err != nil {
-			log(err)
+			logErr(err)
 			return
 		}
 	} else {
 		err := os.MkdirAll(Config.storage, 0755)
 		if err != nil {
-			log(err)
+			logErr(err)
 			return
 		}
 	}
@@ -359,10 +434,13 @@ func main(){
 	}
 	err := os.MkdirAll(Config.tree, 0755)
 	if err != nil {
-		log(err)
+		logErr(err)
 		return
 	}
-	// log(Config)
+
+	if Config.overlayOpts == "" {
+		Config.overlayOpts = "userxattr"
+	}
 
 	// unmounter
 	// for tree, i think it's safe to ignore bind mounts and just lazy umount the parent,
@@ -371,13 +449,13 @@ func main(){
 		for i:=len(Config.mounts)-1; i>=0; i-- {
 			err := syscall.Unmount(Config.mounts[i], 0)
 			if err != nil {
-				log("mystery umount error.", err, "lazy umounting.")
+				logInfo("mystery umount error.", err, "lazy umounting.")
 				err = syscall.Unmount(Config.mounts[i], syscall.MNT_DETACH)
 				if err != nil {
-					log("lazy umount fail???", err)
+					logErr("lazy umount fail???", err)
 				}
 			}
-			log("umounted", Config.mounts[i])
+			logInfo("umounted", Config.mounts[i])
 		}
 	}()
 
@@ -388,10 +466,13 @@ func main(){
 		for _, dir := range []string{Names.lower, Names.upper, Names.overlay}{
 			err := os.MkdirAll(Config.tree + "/" + dir, 0755)
 			if err != nil {
-				log(err)
+				logErr(err)
 				return
 			}
 		}
-
+		// add overlays
+		for _, v := range Config.place {
+			place(v.source, v.sink, v.keys)
+		}
 	}
 }
