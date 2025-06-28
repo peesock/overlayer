@@ -11,61 +11,52 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-
-	"golang.org/x/sys/unix"
+	// "time"
 )
 
+/*
+#define _GNU_SOURCE
+#include <sched.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
+#include <linux/prctl.h>
+#include <linux/capability.h>
+__attribute__((constructor)) void enter_ns(void) {
+	if (getuid() == 0) return;
+	int cap = prctl(PR_CAPBSET_READ, CAP_SYS_ADMIN, 0, 0, 0);
+	if (cap == 1){
+		cap = prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_ADMIN, 0, 0);
+		if (cap == 1) {
+			return;
+		}
+	}
+	struct {
+		char *file;
+		int id;
+	} info[2];
+	info[0].file = "/proc/self/uid_map";
+	info[1].file = "/proc/self/gid_map";
+	info[0].id = geteuid();
+	info[1].id = getegid();
+	unshare(CLONE_NEWUSER|CLONE_NEWNS);
+	FILE *fp;
+	fp = fopen("/proc/self/setgroups", "w+");
+	fputs("deny", fp);
+	fclose(fp);
+	for (int i=0; i<2; i++){
+		fp = fopen(info[i].file, "w+");
+		fprintf(fp, "%d %d 1\n", info[i].id, info[i].id);
+		fclose(fp);
+	}
+}
+*/
+import "C"
+
+// check for and set capabilities with unshare ^
+
 type Keys map[string] string
-
-func hasCapabilities() bool{
-	o, e := unix.PrctlRetInt(unix.PR_CAPBSET_READ, unix.CAP_SYS_ADMIN, 0, 0, 0)
-	if o != 1 {
-		return false
-	}
-	if e != nil {
-		logErr(e)
-		panic(e)
-	}
-	o, e = unix.PrctlRetInt(unix.PR_CAP_AMBIENT, unix.PR_CAP_AMBIENT_IS_SET, unix.CAP_SYS_ADMIN, 0, 0)
-	if o != 1 {
-		return false
-	}
-	if e != nil {
-		logErr(e)
-		panic(e)
-	}
-	return true
-}
-
-func enterNamespace(unshareFlags int){
-	logInfo("entering new namespace")
-	cmd := exec.Command(os.Args[0], os.Args[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	cmd.SysProcAttr = &syscall.SysProcAttr {
-		Unshareflags: uintptr(unshareFlags),
-		UidMappings: []syscall.SysProcIDMap {
-			{
-				// going with root uid method for now because implementing `unshare -c --keep-caps` looks awful
-				ContainerID: 0,
-				HostID: syscall.Getuid(),
-				Size: 1,
-			},
-		},
-		GidMappings: []syscall.SysProcIDMap {
-			{
-				ContainerID: 0,
-				HostID: syscall.Getuid(),
-				Size: 1,
-			},
-		},
-	}
-	err := cmd.Start()
-	if err != nil {
-		logErr(err)
-	}
-}
 
 func makeNextIndex(keys Keys) (string, error) {
 	// list entries and find lowest possible index to add
@@ -179,6 +170,7 @@ func parseId(id string, keys Keys) bool {
 }
 
 func mount(src, targ, fstype string, flags uintptr, data string) {
+	// time.Sleep(time.Millisecond * 100)
 	err := syscall.Mount(src, targ, fstype, flags, data)
 	if err != nil {
 		logErr(err)
@@ -225,7 +217,6 @@ func treeAdd(source, sink, index string) {
 }
 
 func place(source, sink string, keys Keys) error {
-	logInfo("place:", source, sink, keys)
 	var err error
 	index, success := getIndex(keys)
 	if ! success {
@@ -348,28 +339,24 @@ var logInfo = log.New(os.Stderr, Names.program + ": ", 0).Println
 var logErr = log.New(os.Stderr, Names.program + "[error]: ", log.Lshortfile).Println
 
 func main(){
-	// in the future try to detect who owns the current mount namespace as well
-	if (syscall.Getuid() != 0) && ! hasCapabilities() {
-		enterNamespace(syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS)
-		return
-	}
-
 	// flag parsing!!!!!!!
 	var argKeys = make(Keys)
-	for i:=1; i<len(os.Args); i++ {
-		flag := os.Args[i]
+	os.Args = os.Args[1:]
+	for i:=1; len(os.Args)>0; os.Args = os.Args[i:] {
+		i=1
+		flag := os.Args[0]
 		switch flag {
 		case "-g", "-global":
-			Config.global = os.Args[i+1]
+			Config.global = os.Args[1]
 			i++
 		case "-s", "-storage":
-			Config.storage = os.Args[i+1]
+			Config.storage = os.Args[1]
 			i++
 		case "-t", "-tree":
-			Config.storage = os.Args[i+1]
+			Config.storage = os.Args[1]
 			i++
 		case "-k", "-key":
-			argKeys[os.Args[i+1]] = os.Args[i+2]
+			argKeys[os.Args[1]] = os.Args[2]
 			i+=2
 		case "--":
 			i++
@@ -379,12 +366,12 @@ func main(){
 			if b {
 				var args Place
 				if strings.HasPrefix(flag, "-r") {
-					args.source = os.Args[i+1]
+					args.source = os.Args[1]
 					args.sink = args.source
 					i++
 				} else {
-					args.source = os.Args[i+1]
-					args.sink = os.Args[i+2]
+					args.source = os.Args[1]
+					args.sink = os.Args[2]
 					i+=2
 				}
 				if len(argKeys) > 0 {
@@ -446,7 +433,9 @@ func main(){
 	// for tree, i think it's safe to ignore bind mounts and just lazy umount the parent,
 	// but i'm not certain and the granularity here is nice for now.
 	defer func(){
+		// time.Sleep(time.Second)
 		for i:=len(Config.mounts)-1; i>=0; i-- {
+			logInfo("unmounting", Config.mounts[i])
 			err := syscall.Unmount(Config.mounts[i], 0)
 			if err != nil {
 				logInfo("mystery umount error.", err, "lazy umounting.")
@@ -455,7 +444,6 @@ func main(){
 					logErr("lazy umount fail???", err)
 				}
 			}
-			logInfo("umounted", Config.mounts[i])
 		}
 	}()
 
@@ -473,6 +461,16 @@ func main(){
 		// add overlays
 		for _, v := range Config.place {
 			place(v.source, v.sink, v.keys)
+		}
+
+		// execute
+		cmd := exec.Command(os.Args[0], os.Args[1:]...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		err := cmd.Run()
+		if err != nil {
+			logErr(err)
 		}
 	}
 }
