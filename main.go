@@ -3,11 +3,11 @@ package main
 import (
 	"crypto/sha1"
 	"encoding/base64"
-	_ "fmt"
-	"log"
+	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -56,7 +56,62 @@ import "C"
 
 // check for and set capabilities with unshare ^
 
+const (
+	Program = "overlayer"
+	Id = "id"
+	Data = "data"
+	Work = "work"
+	Upper = "upper"
+	Lower = "lower"
+	Overlay = "overlay"
+	TreeDefault = "tree"
+	Bycwd = "by-cwd"
+)
+
 type Keys map[string] string
+
+type Place struct  {
+	source string
+	sink string
+	keys Keys
+}
+
+var Config struct {
+	global string
+	storage string
+	tree string
+	place []Place
+	mounts []string
+	overlayOpts string
+	quiet bool
+}
+
+type LogMode byte
+const (
+	User LogMode = iota
+	Error
+	Debug
+)
+
+func log(mode LogMode, args... any){
+	switch mode {
+	case User:
+		if Config.quiet {
+			return
+		}
+		fmt.Fprintln(os.Stderr, append([]any{Program + ":"}, args...)...)
+	case Debug, Error:
+		var msg string
+		switch mode {
+			case Debug: msg = "DEBUG"
+			case Error: msg = "ERROR"
+		}
+		_, file, line, _ := runtime.Caller(1)
+		fmt.Fprintln(os.Stderr, append([]any{
+			Program + "[" + msg + "]: " + file + ":" + strconv.Itoa(line) + ":",
+		}, args...)...)
+	}
+}
 
 func makeNextIndex(keys Keys) (string, error) {
 	// list entries and find lowest possible index to add
@@ -84,7 +139,7 @@ func makeNextIndex(keys Keys) (string, error) {
 		}
 		break
 	}
-	logInfo("next index:", i)
+	log(User, "Next index:", i)
 
 	// create index
 	iStr := strconv.FormatUint(i, 10)
@@ -104,7 +159,7 @@ func makeNextIndex(keys Keys) (string, error) {
 		keyvalues = keyvalues + k + "\000\n" + v + "\000\n"
 	}
 
-	err = os.WriteFile(index + "/" + Names.id, []byte(keyvalues), 0644)
+	err = os.WriteFile(index + "/" + Id, []byte(keyvalues), 0644)
 	if err != nil {
 		return "", err
 	}
@@ -116,7 +171,7 @@ func makeNextIndex(keys Keys) (string, error) {
 func getIndex(keys Keys) (string, bool) {
 	entries, err := os.ReadDir(Config.storage)
 	if err != nil {
-		logErr(err)
+		log(Error, err)
 	}
 
 	for _, index := range entries {
@@ -125,7 +180,7 @@ func getIndex(keys Keys) (string, bool) {
 		if ! (matched && index.IsDir()) {
 			continue
 		}
-		if parseId(Config.storage + "/" + name + "/" + Names.id, keys) {
+		if parseId(Config.storage + "/" + name + "/" + Id, keys) {
 			return name, true
 		}
 	}
@@ -136,7 +191,7 @@ func getIndex(keys Keys) (string, bool) {
 func parseId(id string, keys Keys) bool {
 	keyvalues, err := os.ReadFile(id)
 	if err != nil {
-		logErr(err)
+		log(Error, err)
 		return false
 	}
 	value := ""
@@ -144,14 +199,10 @@ func parseId(id string, keys Keys) bool {
 	for i,ii := 0,0; i<len(keyvalues)-1; i++ {
 		if keyvalues[i] == '\000' && keyvalues[i+1] == '\n' {
 			line := string(keyvalues[ii:i])
-			// log("line:", line)
 			if n % 2 == 0 { // line is a key
-				// log("key")
 				value = keys[line]
 			} else { // line is a value
-				// log("value")
 				if value != line {
-					// log("value issue")
 					return false
 				}
 			}
@@ -162,7 +213,6 @@ func parseId(id string, keys Keys) bool {
 	}
 
 	if n/2 != len(keys) {
-		// log("numbah issue", n, len(keys), keys)
 		return false
 	}
 
@@ -173,12 +223,11 @@ func mount(src, targ, fstype string, flags uintptr, data string) {
 	// time.Sleep(time.Millisecond * 100)
 	err := syscall.Mount(src, targ, fstype, flags, data)
 	if err != nil {
-		logErr(err)
-		panic("mount failure")
+		panic(err.Error())
 	}
 	if fstype != "" {
 		Config.mounts = append(Config.mounts, targ)
-		logInfo("mounted", fstype, "on", targ)
+		log(User, "Mounted", fstype, "on", targ)
 	}
 }
 
@@ -200,20 +249,20 @@ func treeAdd(source, sink, index string) {
 	args := []string{
 		// lower
 		source,
-		strings.Join([]string{Config.tree, Names.lower, sink}, "/"),
+		strings.Join([]string{Config.tree, Lower, sink}, "/"),
 		// upper
-		strings.Join([]string{Config.storage, index, Names.data}, "/"),
-		strings.Join([]string{Config.tree, Names.upper, sink}, "/"),
+		strings.Join([]string{Config.storage, index, Data}, "/"),
+		strings.Join([]string{Config.tree, Upper, sink}, "/"),
 		// overlay
 		sink,
-		strings.Join([]string{Config.tree, Names.overlay, sink}, "/"),
+		strings.Join([]string{Config.tree, Overlay, sink}, "/"),
 	}
 	for i:=0; i<len(args); i+=2 {
 		os.MkdirAll(args[i+1], 0755)
 		mount(args[i], args[i+1], "bind", syscall.MS_BIND, "")
 	}
 
-	logInfo("tree added")
+	log(User, "Tree added")
 }
 
 func place(source, sink string, keys Keys) error {
@@ -229,10 +278,10 @@ func place(source, sink string, keys Keys) error {
 	indexPath := escapeOverlayOpts(Config.storage) + "/" + index
 	data :=
 		"lowerdir=" + escapeOverlayOpts(source) +
-		",upperdir=" + indexPath + "/" + Names.data +
-		",workdir=" + indexPath + "/" + Names.work +
+		",upperdir=" + indexPath + "/" + Data +
+		",workdir=" + indexPath + "/" + Work +
 		"," + Config.overlayOpts
-	mount("a", "b", "overlay", 0, data)
+	mount(source, sink, "overlay", 0, data)
 	treeAdd(source, sink, index)
 
 	return nil
@@ -245,7 +294,7 @@ func makeStorage() (string, error) {
 	}
 	hash := sha1.Sum([]byte(dir))
 	out := base64.RawURLEncoding.EncodeToString(hash[:])
-	out = strings.Join([]string{Config.global, Names.bycwd, out}, "/")
+	out = strings.Join([]string{Config.global, Bycwd, out}, "/")
 	_, err = os.Stat(out)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -257,7 +306,7 @@ func makeStorage() (string, error) {
 			if err != nil {
 				return "", err
 			}
-			logInfo("made storage", out)
+			log(User, "Created storage:", out)
 		} else {
 			return "", err // error reading
 		}
@@ -298,46 +347,6 @@ func ioParse(args Place, flag string) Keys {
 	return out
 }
 
-var Names = struct{
-	program string
-	id string
-	data string
-	work string
-	upper string
-	lower string
-	overlay string
-	treeDefault string
-	bycwd string
-}{
-	"overlayer",
-	"id",
-	"data",
-	"work",
-	"upper",
-	"lower",
-	"overlay",
-	"tree",
-	"by-cwd",
-}
-
-type Place struct  {
-	source string
-	sink string
-	keys Keys
-}
-
-var Config struct {
-	global string
-	storage string
-	tree string
-	place []Place
-	mounts []string
-	overlayOpts string
-}
-
-var logInfo = log.New(os.Stderr, Names.program + ": ", 0).Println
-var logErr = log.New(os.Stderr, Names.program + "[error]: ", log.Lshortfile).Println
-
 func main(){
 	// flag parsing!!!!!!!
 	var argKeys = make(Keys)
@@ -346,6 +355,8 @@ func main(){
 		i=1
 		flag := os.Args[0]
 		switch flag {
+		case "-q", "-quiet":
+			Config.quiet = true
 		case "-g", "-global":
 			Config.global = os.Args[1]
 			i++
@@ -386,6 +397,27 @@ func main(){
 		}
 	}
 	exit:
+	var cmd *exec.Cmd
+	fi, _ := os.Stdin.Stat()
+	if len(os.Args) == 0 {
+		if fi.Mode() & os.ModeCharDevice == 0 {
+			// not a terminal
+			log(Error, "Not in a terminal; must specify command to run.")
+			return
+		}
+		shell, b := os.LookupEnv("SHELL")
+		if b {
+			cmd = exec.Command(shell)
+		} else {
+			log(Error, "Could not run $SHELL.")
+			return
+		}
+	} else {
+		cmd = exec.Command(os.Args[0], os.Args[1:]...)
+	}
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
 	// defaults
 	if Config.global == "" {
@@ -393,35 +425,35 @@ func main(){
 		if ! b {
 			xdgDataHome, b = os.LookupEnv("HOME")
 			if ! b {
-				logErr("no HOME??????")
+				log(Error, "Could not find $HOME.")
 				return
 			}
 			xdgDataHome = xdgDataHome + "/.local/share"
 		}
-		Config.global = xdgDataHome + "/" + Names.program
+		Config.global = xdgDataHome + "/" + Program
 	}
 
 	if Config.storage == "" {
 		var err error
 		Config.storage, err = makeStorage()
 		if err != nil {
-			logErr(err)
+			log(Error, err)
 			return
 		}
 	} else {
 		err := os.MkdirAll(Config.storage, 0755)
 		if err != nil {
-			logErr(err)
+			log(Error, err)
 			return
 		}
 	}
 
 	if Config.tree == "" {
-		Config.tree = Config.storage + "/" + Names.treeDefault
+		Config.tree = Config.storage + "/" + TreeDefault
 	}
 	err := os.MkdirAll(Config.tree, 0755)
 	if err != nil {
-		logErr(err)
+		log(Error, err)
 		return
 	}
 
@@ -435,13 +467,13 @@ func main(){
 	defer func(){
 		// time.Sleep(time.Second)
 		for i:=len(Config.mounts)-1; i>=0; i-- {
-			logInfo("unmounting", Config.mounts[i])
+			log(User, "Unmounting", Config.mounts[i])
 			err := syscall.Unmount(Config.mounts[i], 0)
 			if err != nil {
-				logInfo("mystery umount error.", err, "lazy umounting.")
+				log(User, "Umount error.", err, "Lazy umounting.")
 				err = syscall.Unmount(Config.mounts[i], syscall.MNT_DETACH)
 				if err != nil {
-					logErr("lazy umount fail???", err)
+					log(Error, "Could not lazily umount.", err)
 				}
 			}
 		}
@@ -451,10 +483,10 @@ func main(){
 		// create tree
 		mount("tmpfs", Config.tree, "tmpfs", 0, "")
 		mount("", Config.tree, "", syscall.MS_SLAVE, "")
-		for _, dir := range []string{Names.lower, Names.upper, Names.overlay}{
+		for _, dir := range []string{Lower, Upper, Overlay}{
 			err := os.MkdirAll(Config.tree + "/" + dir, 0755)
 			if err != nil {
-				logErr(err)
+				log(Error, err)
 				return
 			}
 		}
@@ -462,15 +494,10 @@ func main(){
 		for _, v := range Config.place {
 			place(v.source, v.sink, v.keys)
 		}
-
 		// execute
-		cmd := exec.Command(os.Args[0], os.Args[1:]...)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
 		err := cmd.Run()
 		if err != nil {
-			logErr(err)
+			log(Error, err)
 		}
 	}
 }
