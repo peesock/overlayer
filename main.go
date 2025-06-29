@@ -64,7 +64,7 @@ const (
 	Upper = "upper"
 	Lower = "lower"
 	Overlay = "overlay"
-	TreeDefault = "tree"
+	Tree = "tree"
 	Bycwd = "by-cwd"
 )
 
@@ -84,6 +84,8 @@ var Config struct {
 	mounts []string
 	overlayOpts string
 	quiet bool
+	relative bool
+	noTree bool
 }
 
 type LogMode byte
@@ -246,6 +248,10 @@ func escapeOverlayOpts(s string) string {
 }
 
 func treeAdd(source, sink, index string) {
+	if Config.noTree {
+		return
+	}
+	log(User, "Adding tree")
 	args := []string{
 		// lower
 		source,
@@ -261,15 +267,32 @@ func treeAdd(source, sink, index string) {
 		os.MkdirAll(args[i+1], 0755)
 		mount(args[i], args[i+1], "bind", syscall.MS_BIND, "")
 	}
-
-	log(User, "Tree added")
 }
 
-func place(source, sink string, keys Keys) error {
+func treeCreate() error {
+	if Config.noTree {
+		return nil
+	}
+	err := os.MkdirAll(Config.tree, 0755)
+	if err != nil {
+		return err
+	}
+	mount("tmpfs", Config.tree, "tmpfs", 0, "")
+	mount("", Config.tree, "", syscall.MS_SLAVE, "")
+	for _, dir := range []string{Lower, Upper, Overlay}{
+		err = os.MkdirAll(Config.tree + "/" + dir, 0755)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p Place) place() error {
 	var err error
-	index, success := getIndex(keys)
+	index, success := getIndex(p.keys)
 	if ! success {
-		index, err = makeNextIndex(keys)
+		index, err = makeNextIndex(p.keys)
 		if err != nil {
 			return err
 		}
@@ -277,12 +300,12 @@ func place(source, sink string, keys Keys) error {
 
 	indexPath := escapeOverlayOpts(Config.storage) + "/" + index
 	data :=
-		"lowerdir=" + escapeOverlayOpts(source) +
+		"lowerdir=" + escapeOverlayOpts(p.source) +
 		",upperdir=" + indexPath + "/" + Data +
 		",workdir=" + indexPath + "/" + Work +
 		"," + Config.overlayOpts
-	mount(source, sink, "overlay", 0, data)
-	treeAdd(source, sink, index)
+	mount(p.source, p.sink, "overlay", 0, data)
+	treeAdd(p.source, p.sink, index)
 
 	return nil
 }
@@ -315,33 +338,28 @@ func makeStorage() (string, error) {
 }
 
 func ioParse(args Place, flag string) Keys {
-	type opts uint8
-	const (
-		IN opts = 1 << iota
-		OUT
-	)
-	var o opts
+	IN := false
+	OUT := false
 	out := make(Keys)
-	i := strings.IndexByte(flag, ',')
-	if i < 0 {
+	if i := strings.IndexByte(flag, ','); i < 0 {
 		if args.sink == args.source { // defaults
-			o = IN | OUT
+			IN, OUT = true, true
 		} else {
-			o = OUT
+			OUT = true
 		}
 	} else {
 		s := flag[i+1:]
 		if strings.Contains(s, "i") {
-			o |= IN
+			IN = true
 		}
 		if strings.Contains(s, "o") {
-			o |= OUT
+			OUT = true
 		}
 	}
-	if o & IN == IN {
+	if IN {
 		out["source"] = args.source
 	}
-	if o & OUT == OUT {
+	if OUT {
 		out["sink"] = args.sink
 	}
 	return out
@@ -357,6 +375,10 @@ func main(){
 		switch flag {
 		case "-q", "-quiet":
 			Config.quiet = true
+		case "-R", "-relative":
+			Config.relative = true
+		case "-T", "-notree":
+			Config.noTree = true
 		case "-g", "-global":
 			Config.global = os.Args[1]
 			i++
@@ -448,13 +470,8 @@ func main(){
 		}
 	}
 
-	if Config.tree == "" {
-		Config.tree = Config.storage + "/" + TreeDefault
-	}
-	err := os.MkdirAll(Config.tree, 0755)
-	if err != nil {
-		log(Error, err)
-		return
+	if ! Config.noTree && Config.tree == "" {
+		Config.tree = Config.storage + "/" + Tree
 	}
 
 	if Config.overlayOpts == "" {
@@ -470,7 +487,8 @@ func main(){
 			log(User, "Unmounting", Config.mounts[i])
 			err := syscall.Unmount(Config.mounts[i], 0)
 			if err != nil {
-				log(User, "Umount error.", err, "Lazy umounting.")
+				log(User, "Umount error.", err)
+				log(User, "Lazy umounting.")
 				err = syscall.Unmount(Config.mounts[i], syscall.MNT_DETACH)
 				if err != nil {
 					log(Error, "Could not lazily umount.", err)
@@ -481,23 +499,38 @@ func main(){
 
 	if len(Config.place) > 0 {
 		// create tree
-		mount("tmpfs", Config.tree, "tmpfs", 0, "")
-		mount("", Config.tree, "", syscall.MS_SLAVE, "")
-		for _, dir := range []string{Lower, Upper, Overlay}{
-			err := os.MkdirAll(Config.tree + "/" + dir, 0755)
-			if err != nil {
-				log(Error, err)
-				return
-			}
+		err := treeCreate()
+		if err != nil {
+			log(Error, err)
+			return
 		}
 		// add overlays
 		for _, v := range Config.place {
-			place(v.source, v.sink, v.keys)
+			v.place()
 		}
 		// execute
-		err := cmd.Run()
-		if err != nil {
-			log(Error, err)
-		}
+		ch := make(chan bool)
+		go func(){
+			defer func(){
+				ch <- true
+			}()
+			runtime.LockOSThread()
+			err := syscall.Unshare(syscall.CLONE_NEWNS)
+			if err != nil {
+				log(Error, err)
+			}
+			// in case real cwd was mounted over
+			cwd, err := os.Getwd()
+			if err != nil {
+				log(Error, err)
+			}
+			os.Chdir(cwd)
+			if err != nil {
+				log(Error, err)
+			}
+			cmd.Run()
+		}()
+		<- ch
+		// cmd.ProcessState.ExitCode()
 	}
 }
