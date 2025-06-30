@@ -1,4 +1,8 @@
 package main
+// todo
+// log mkdirs
+// test overlayescapeopts
+// whether to add tree-only mode
 
 import (
 	"crypto/sha1"
@@ -6,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -79,13 +84,13 @@ type Place struct  {
 var Config struct {
 	global string
 	storage string
-	tree string
+	tree bool
+	treeDir string
 	place []Place
 	mounts []string
 	overlayOpts string
 	quiet bool
-	relative bool
-	noTree bool
+	relative string
 }
 
 type LogMode byte
@@ -248,20 +253,20 @@ func escapeOverlayOpts(s string) string {
 }
 
 func treeAdd(source, sink, index string) {
-	if Config.noTree {
+	if ! Config.tree {
 		return
 	}
 	log(User, "Adding tree")
 	args := []string{
 		// lower
 		source,
-		strings.Join([]string{Config.tree, Lower, sink}, "/"),
+		filepath.Join(Config.treeDir, Lower, sink),
 		// upper
-		strings.Join([]string{Config.storage, index, Data}, "/"),
-		strings.Join([]string{Config.tree, Upper, sink}, "/"),
+		filepath.Join(Config.storage, index, Data),
+		filepath.Join(Config.treeDir, Upper, sink),
 		// overlay
 		sink,
-		strings.Join([]string{Config.tree, Overlay, sink}, "/"),
+		filepath.Join(Config.treeDir, Overlay, sink),
 	}
 	for i:=0; i<len(args); i+=2 {
 		os.MkdirAll(args[i+1], 0755)
@@ -270,17 +275,17 @@ func treeAdd(source, sink, index string) {
 }
 
 func treeCreate() error {
-	if Config.noTree {
+	if ! Config.tree {
 		return nil
 	}
-	err := os.MkdirAll(Config.tree, 0755)
+	err := os.MkdirAll(Config.treeDir, 0755)
 	if err != nil {
 		return err
 	}
-	mount("tmpfs", Config.tree, "tmpfs", 0, "")
-	mount("", Config.tree, "", syscall.MS_SLAVE, "")
+	mount("tmpfs", Config.treeDir, "tmpfs", 0, "")
+	mount("", Config.treeDir, "", syscall.MS_SLAVE, "")
 	for _, dir := range []string{Lower, Upper, Overlay}{
-		err = os.MkdirAll(Config.tree + "/" + dir, 0755)
+		err = os.MkdirAll(Config.treeDir + "/" + dir, 0755)
 		if err != nil {
 			return err
 		}
@@ -297,16 +302,14 @@ func (p Place) place() error {
 			return err
 		}
 	}
-
 	indexPath := escapeOverlayOpts(Config.storage) + "/" + index
 	data :=
 		"lowerdir=" + escapeOverlayOpts(p.source) +
 		",upperdir=" + indexPath + "/" + Data +
 		",workdir=" + indexPath + "/" + Work +
 		"," + Config.overlayOpts
-	mount(p.source, p.sink, "overlay", 0, data)
+	mount(p.source, filepath.Join(Config.relative, p.sink), "overlay", 0, data)
 	treeAdd(p.source, p.sink, index)
-
 	return nil
 }
 
@@ -317,7 +320,7 @@ func makeStorage() (string, error) {
 	}
 	hash := sha1.Sum([]byte(dir))
 	out := base64.RawURLEncoding.EncodeToString(hash[:])
-	out = strings.Join([]string{Config.global, Bycwd, out}, "/")
+	out = filepath.Join(Config.global, Bycwd, out)
 	_, err = os.Stat(out)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -365,6 +368,19 @@ func ioParse(args Place, flag string) Keys {
 	return out
 }
 
+func realpath(s string) string {
+	// we don't care about symlinks
+	// same as `realpath -ms --relative-base=.`
+	if filepath.IsLocal(s) {
+		return filepath.Clean(s)
+	}
+	s, err := filepath.Abs(s)
+	if err != nil {
+		panic(err.Error())
+	}
+	return s
+}
+
 func main(){
 	// flag parsing!!!!!!!
 	var argKeys = make(Keys)
@@ -375,40 +391,54 @@ func main(){
 		switch flag {
 		case "-q", "-quiet":
 			Config.quiet = true
-		case "-R", "-relative":
-			Config.relative = true
-		case "-T", "-notree":
-			Config.noTree = true
+		case "-su":
+			Config.overlayOpts = "xino=auto,uuid=auto,metacopy=on"
+		case "-t", "-tree":
+			Config.tree = true
+		case "-T", "-treedir":
+			Config.tree = true
+			Config.treeDir = os.Args[1]
+			i++
 		case "-g", "-global":
 			Config.global = os.Args[1]
 			i++
 		case "-s", "-storage":
 			Config.storage = os.Args[1]
 			i++
-		case "-t", "-tree":
-			Config.storage = os.Args[1]
+		case "-R", "-relative":
+			_, err := os.Stat(os.Args[1])
+			if err != nil {
+				log(User, "Relative dir '" + os.Args[1] + "' could not be statted.")
+				return
+			}
+			Config.relative = os.Args[1]
 			i++
 		case "-k", "-key":
 			argKeys[os.Args[1]] = os.Args[2]
 			i+=2
 		case "--":
-			i++
+			os.Args = os.Args[i:]
 			goto exit
 		default:
 			b, _ := regexp.MatchString(`^(-p(|lace)|-r(|eplace))(|,[io]{1,2})$`, flag)
 			if b {
 				var args Place
+				_, err := os.Stat(os.Args[1])
+				if err != nil {
+					log(User, "Source dir '" + os.Args[1] + "' could not be statted.")
+					return
+				}
+				args.source = realpath(os.Args[1])
 				if strings.HasPrefix(flag, "-r") {
-					args.source = os.Args[1]
 					args.sink = args.source
 					i++
 				} else {
-					args.source = os.Args[1]
-					args.sink = os.Args[2]
+					args.sink = realpath(os.Args[2])
 					i+=2
 				}
 				if len(argKeys) > 0 {
 					args.keys = argKeys
+					clear(argKeys)
 				} else {
 					args.keys = ioParse(args, flag)
 				}
@@ -470,10 +500,9 @@ func main(){
 		}
 	}
 
-	if ! Config.noTree && Config.tree == "" {
-		Config.tree = Config.storage + "/" + Tree
+	if Config.tree && Config.treeDir == "" {
+		Config.treeDir = Config.storage + "/" + Tree
 	}
-
 	if Config.overlayOpts == "" {
 		Config.overlayOpts = "userxattr"
 	}
@@ -497,40 +526,42 @@ func main(){
 		}
 	}()
 
-	if len(Config.place) > 0 {
-		// create tree
-		err := treeCreate()
+	// create tree
+	err := treeCreate()
+	if err != nil {
+		log(Error, err)
+		return
+	}
+	// add overlays
+	for _, v := range Config.place {
+		err = v.place()
 		if err != nil {
 			log(Error, err)
 			return
 		}
-		// add overlays
-		for _, v := range Config.place {
-			v.place()
-		}
-		// execute
-		ch := make(chan bool)
-		go func(){
-			defer func(){
-				ch <- true
-			}()
-			runtime.LockOSThread()
-			err := syscall.Unshare(syscall.CLONE_NEWNS)
-			if err != nil {
-				log(Error, err)
-			}
-			// in case real cwd was mounted over
-			cwd, err := os.Getwd()
-			if err != nil {
-				log(Error, err)
-			}
-			os.Chdir(cwd)
-			if err != nil {
-				log(Error, err)
-			}
-			cmd.Run()
-		}()
-		<- ch
-		// cmd.ProcessState.ExitCode()
 	}
+	// execute
+	ch := make(chan bool)
+	go func(){
+		defer func(){
+			ch <- true
+		}()
+		runtime.LockOSThread()
+		err := syscall.Unshare(syscall.CLONE_NEWNS)
+		if err != nil {
+			log(Error, err)
+		}
+		// in case cwd was mounted over
+		cwd, err := os.Getwd()
+		if err != nil {
+			log(Error, err)
+		}
+		os.Chdir(cwd)
+		if err != nil {
+			log(Error, err)
+		}
+		cmd.Run()
+	}()
+	<- ch
+	// cmd.ProcessState.ExitCode()
 }
