@@ -1,16 +1,16 @@
 package main
 // Todo:
-// Log mkdirs
 // Test overlayescapeopts
 // Optimize -key usage
-// Whether to add tree-only mode
 // Handle Config.overlay / make the root pivoting optional
-// Submounter should run in flag parsing to add placements and also binds (make a new Config entry)
-// Also, make submounter a method.
 // Compile the regex in getIndex
 // Change some struct arguments to struct pointers for speed
 // Add recursive case for both b and o opts, add opt for socket files and stuff, perhaps even a
 // custom function to match types of files to bind mount.
+// Separate file based submount searching and *mount* based searching. Find mounts based off of
+// /proc/self/mountinfo.
+// Fuser for umounter.
+// Code documentation.
 
 import (
 	"crypto/sha1"
@@ -122,7 +122,7 @@ var Config struct {
 	overlayOpts string
 	quiet bool
 	overlay string
-	// recurse Recurse
+	debug bool
 }
 
 type LogMode byte
@@ -142,8 +142,13 @@ func log(mode LogMode, args... any){
 	case Debug, Error:
 		var msg string
 		switch mode {
-			case Debug: msg = "DEBUG"
-			case Error: msg = "ERROR"
+			case Debug:
+				if ! Config.debug {
+					return
+				}
+				msg = "DEBUG"
+			case Error:
+				msg = "ERROR"
 		}
 		_, file, line, _ := runtime.Caller(1)
 		fmt.Fprintln(os.Stderr, append([]any{
@@ -154,11 +159,11 @@ func log(mode LogMode, args... any){
 
 func makeIndex(index uint64, keys Keys) (error) {
 	indexPath := Config.storage + "/" + strconv.FormatUint(index, 10)
-	err := os.MkdirAll(indexPath + "/" + IndexData, 0755)
+	err := mkdir(indexPath + "/" + IndexData)
 	if err != nil {
 		return err
 	}
-	err = os.MkdirAll(indexPath + "/" + IndexWork, 0755)
+	err = mkdir(indexPath + "/" + IndexWork)
 	if err != nil {
 		return err
 	}
@@ -306,6 +311,7 @@ func escapeOverlayOpts(s string) string {
 func submounter(dir string, data *syscall.Stat_t, opts *Recurse, list *[]Mount) {
 	if data == nil {
 		data = new(syscall.Stat_t)
+		syscall.Lstat(dir, data)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -363,7 +369,7 @@ func treeAdd(m Mount) {
 		filepath.Join(Config.treeDir, TreeOverlay, m.sink),
 	}
 	for i:=0; i<len(args); i+=2 {
-		os.MkdirAll(args[i+1], 0755)
+		mkdir(args[i+1])
 		mount(args[i], args[i+1], "bind", syscall.MS_BIND, "")
 	}
 }
@@ -409,7 +415,8 @@ func makeStorage() (string, error) {
 	_, err = os.Stat(out)
 	if err != nil {
 		if os.IsNotExist(err) {
-			err = os.MkdirAll(out, 0755)
+			log(User, "Creating new storage:", out)
+			err = mkdir(out)
 			if err != nil {
 				return "", err
 			}
@@ -417,7 +424,6 @@ func makeStorage() (string, error) {
 			if err != nil {
 				return "", err
 			}
-			log(User, "Created storage:", out)
 		} else {
 			return "", err // error reading
 		}
@@ -454,13 +460,22 @@ func realpath(s string, complete bool) string {
 	return s
 }
 
-func statCheck(s string) bool {
-	_, err := os.Stat(s)
+func statCheck(dir string, quiet bool) error {
+	_, err := os.Stat(dir)
 	if err != nil {
-		log(User, "'" + s + "' could not be statted:", err)
-		return false
+		if ! quiet {
+			log(User, "'" + dir + "' could not be statted:", err)
+		}
 	}
-	return true
+	return err
+}
+
+func mkdir(dir string) error {
+	if statCheck(dir, true) != nil {
+		log(Debug, "Creating", dir)
+		return os.MkdirAll(dir, 0755)
+	}
+	return nil
 }
 
 func main(){
@@ -487,6 +502,8 @@ func main(){
 		i=1
 		flag := os.Args[0]
 		switch flag {
+		case "-d", "-debug":
+			Config.debug = true
 		case "-q", "-quiet":
 			Config.quiet = true
 		case "-su":
@@ -516,11 +533,11 @@ func main(){
 		default:
 			switch {
 			case flagOpts(flag, "io", "-p", "-place", "-r", "-replace"):
-				var args Mount
-				args.overlay = new(Overlay)
-				if ! statCheck(os.Args[1]){
+				if statCheck(os.Args[1], false) != nil {
 					return
 				}
+				var args Mount
+				args.overlay = new(Overlay)
 				args.source = os.Args[1]
 				replace := strings.HasPrefix(flag, "-r")
 				if replace {
@@ -624,7 +641,7 @@ func main(){
 			return
 		}
 	} else {
-		err := os.MkdirAll(Config.storage, 0755)
+		err := mkdir(Config.storage)
 		if err != nil {
 			log(Error, err)
 			return
@@ -656,7 +673,7 @@ func main(){
 				return
 			}
 		}
-		log(User, "Index", strconv.FormatUint(index, 10) + ":", m.sink)
+		log(User, "Index", strconv.FormatUint(index, 10) + "holds:", m.sink)
 		m.overlay.index = index
 	}
 	// further setup
@@ -667,14 +684,14 @@ func main(){
 		log(Error, err)
 	}
 	base := Config.storage + "/" + RootBase
-	err = os.MkdirAll(base, 0755)
+	err = mkdir(base)
 	if err != nil {
 		log(Error, err)
 		return
 	}
 	syscall.Mount("tmpfs", base, "tmpfs", 0, "")
-	os.Mkdir(base + "/" + RootOld, 0755)
-	os.Mkdir(base + "/" + RootNew, 0755)
+	mkdir(base + "/" + RootOld)
+	mkdir(base + "/" + RootNew)
 	err = syscall.PivotRoot(base, base + "/" + RootOld)
 	if err != nil {
 		log(Error, err)
@@ -762,7 +779,7 @@ func main(){
 			Config.treeDir = Config.storage + "/" + Tree
 		}
 		// make tree
-		err := os.MkdirAll(Config.treeDir, 0755)
+		err := mkdir(Config.treeDir)
 		if err != nil {
 			log(Error, err)
 			return
@@ -770,7 +787,7 @@ func main(){
 		syscall.Mount("tmpfs", Config.treeDir, "tmpfs", 0, "")
 		syscall.Mount("", Config.treeDir, "", syscall.MS_SLAVE, "")
 		for _, dir := range []string{TreeLower, TreeUpper, TreeOverlay}{
-			err = os.MkdirAll(Config.treeDir + "/" + dir, 0755)
+			err = mkdir(Config.treeDir + "/" + dir)
 			if err != nil {
 				log(Error, err)
 				return
