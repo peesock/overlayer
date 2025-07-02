@@ -1,16 +1,12 @@
 package main
 // Todo:
-// Test overlayescapeopts
-// Optimize -key usage
+// Optimize -key usage, add key append mode
 // Handle Config.overlay / make the root pivoting optional
 // Compile the regex in getIndex
 // Change some struct arguments to struct pointers for speed
-// Add recursive case for both b and o opts, add opt for socket files and stuff, perhaps even a
-// custom function to match types of files to bind mount.
-// Separate file based submount searching and *mount* based searching. Find mounts based off of
-// /proc/self/mountinfo.
 // Fuser for umounter.
 // Code documentation.
+// Work on recurseFiles' uses
 
 import (
 	"crypto/sha1"
@@ -24,7 +20,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	// "time"
 )
 
 /*
@@ -267,7 +262,6 @@ func parseId(id string, keys Keys) bool {
 }
 
 func umounter(){
-	// time.Sleep(time.Second)
 	for i:=len(Config.mountpoints)-1; i>=0; i-- {
 		log(User, "Unmounting", Config.mountpoints[i])
 		err := syscall.Unmount(Config.mountpoints[i], 0)
@@ -282,16 +276,18 @@ func umounter(){
 	}
 }
 
-func mount(src, targ, fstype string, flags uintptr, data string) {
+func mount(src, targ, fstype string, flags uintptr, data string) error {
 	// time.Sleep(time.Millisecond * 100)
 	if fstype != "" {
-		log(User, "Mounting", fstype + ":", targ)
+		sfx, _ := strings.CutPrefix(targ, "/" + RootNew)
+		log(User, "Mounting", fstype + ":", sfx)
 	}
 	err := syscall.Mount(src, targ, fstype, flags, data)
 	if err != nil {
 		log(Error, "mount arguments:", []any{src, targ, fstype, flags, data})
-		panic(err.Error())
+		return err
 	}
+	return nil
 }
 
 func escapeOverlayOpts(s string) string {
@@ -308,7 +304,7 @@ func escapeOverlayOpts(s string) string {
 	return string(out)
 }
 
-func submounter(dir string, data *syscall.Stat_t, opts *Recurse, list *[]Mount) {
+func recurseFiles(dir string, data *syscall.Stat_t, opts *Recurse) {
 	if data == nil {
 		data = new(syscall.Stat_t)
 		syscall.Lstat(dir, data)
@@ -326,30 +322,91 @@ func submounter(dir string, data *syscall.Stat_t, opts *Recurse, list *[]Mount) 
 			continue
 		}
 		if data.Dev != currentDev {
-			mount := Mount{
-				source: realpath(name, true),
-			}
-			mount.sink = mount.source
+			addSubmount(name, opts)
 			switch {
+			// case opts.overlay:
 			case opts.bind:
-				mount.bind = new(Bind)
-				mount.bind.recursive = true
-				*list = append(*list, mount)
 				continue
-			case opts.overlay:
-				mount.overlay = new(Overlay)
-				keys := make(Keys)
-				keys["source"] = mount.source
-				keys["sink"] = mount.sink
-				keys["recursive"] = "true"
-				mount.overlay.keys = keys
-				*list = append(*list, mount)
 			}
 		}
 		if v.IsDir() {
-			submounter(name, data, opts, list)
+			recurseFiles(name, data, opts)
 		}
 	}
+}
+
+func recurseMounts(dir string, opts *Recurse) {
+	dir = realpath(dir, true)
+	list := parseMountinfo()
+	for _, mountpoint := range list {
+		if strings.HasPrefix(mountpoint, dir) {
+			addSubmount(mountpoint, opts)
+		}
+	}
+}
+
+func addSubmount(dir string, opts *Recurse) {
+	mount := Mount{
+		source: realpath(dir, true),
+	}
+	mount.sink = mount.source
+	switch {
+	case opts.overlay:
+		mount.overlay = new(Overlay)
+		keys := make(Keys)
+		keys["source"] = mount.source
+		keys["sink"] = mount.sink
+		keys["recursive"] = "true"
+		mount.overlay.keys = keys
+		// if opts.bind {
+		// 	mount.retry = true
+		Config.mounts = append(Config.mounts, mount)
+	case opts.bind:
+		mount.bind = new(Bind)
+		mount.bind.recursive = true
+		Config.mounts = append(Config.mounts, mount)
+	}
+}
+
+func parseMountinfo() []string {
+	bytes, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		panic(err.Error())
+	}
+	entries := make([][]byte, 0, 20)
+	lineRead:
+	var i int;
+	for n:=0; n<4; i++ {
+		if bytes[i] == ' ' {
+			n++
+		}
+	}
+	var j = i+1
+	for bytes[j] != ' ' {
+		j++
+	}
+	entries = append(entries, bytes[i:j])
+	bytes = bytes[j+1:]
+	for i := range bytes {
+		if bytes[i] == '\n' {
+			bytes = bytes[i+1:]
+			if len(bytes) != 0 {
+				goto lineRead
+			}
+		}
+	}
+	out := make([]string, len(entries))
+	for line, entry := range entries {
+		for i=0; i<len(entry); i++ {
+			if entry[i] == '\\' {
+				char, _ := strconv.ParseUint(string(entry[i+1:i+4]), 8, 8)
+				entry[i] = byte(char)
+				entry = append(entry[:i+1], entry[i+4:]...)
+			}
+		}
+		out[line] = string(entry)
+	}
+	return out
 }
 
 func treeAdd(m Mount) {
@@ -404,7 +461,7 @@ func (p Mount) mount() error {
 	}
 }
 
-func makeStorage() (string, error) {
+func setStorage() (string, error) {
 	dir, err := os.Getwd()
 	if err != nil {
 		return "", err
@@ -496,7 +553,7 @@ func main(){
 
 	// flag parsing!!!!!!!
 	var argKeys = make(Keys)
-	var argRecurse *Recurse = nil
+	var argRecurseOpts *Recurse = nil
 	os.Args = os.Args[1:]
 	for i:=1; len(os.Args)>0; os.Args = os.Args[i:] {
 		i=1
@@ -570,25 +627,23 @@ func main(){
 				args.source = realpath(args.source, true)
 				args.sink = realpath(args.sink, true)
 				Config.mounts = append(Config.mounts, args)
-				if argRecurse != nil {
-					submounts := make([]Mount, 0)
-					submounter(args.sink, nil, argRecurse, &submounts)
-					Config.mounts = append(Config.mounts, submounts...)
-
-					argRecurse = nil
+				if argRecurseOpts != nil {
+					recurseMounts(args.sink, argRecurseOpts)
+					// recurseFiles(args.sink, nil, argRecurseOpts)
+					argRecurseOpts = nil
 				}
 
 			case flagOpts(flag, "bo", "-R", "-recurse", "-Recurse"):
-				argRecurse = new(Recurse)
+				argRecurseOpts = new(Recurse)
 				if optParse(flag, ""){
 					if optParse(flag, "b") {
-						argRecurse.bind = true
+						argRecurseOpts.bind = true
 					}
 					if optParse(flag, "o") {
-						argRecurse.overlay = true
+						argRecurseOpts.overlay = true
 					}
 				} else {
-					argRecurse.bind = true
+					argRecurseOpts.bind = true
 				}
 
 			default:
@@ -635,7 +690,7 @@ func main(){
 
 	if Config.storage == "" {
 		var err error
-		Config.storage, err = makeStorage()
+		Config.storage, err = setStorage()
 		if err != nil {
 			log(Error, err)
 			return
@@ -673,7 +728,7 @@ func main(){
 				return
 			}
 		}
-		log(User, "Index", strconv.FormatUint(index, 10) + "holds:", m.sink)
+		log(User, "Index", strconv.FormatUint(index, 10) + " holds:", m.sink)
 		m.overlay.index = index
 	}
 	// further setup
