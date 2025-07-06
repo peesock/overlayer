@@ -28,14 +28,14 @@ const (
 	IndexId = "id"
 	IndexData = "data"
 	IndexWork = "work"
-	Tree = "tree"
-	TreeUpper = "upper"
-	TreeLower = "lower"
-	TreeOverlay = "overlay"
-	RootBase = "root"
-	RootNew = "new"
-	RootOld = "old"
-	Bycwd = "by-cwd"
+	DbgTree = "tree"
+	DbgTreeUpper = "upper"
+	DbgTreeLower = "lower"
+	DbgTreeOverlay = "overlay"
+	PivotBase = "pivot"
+	PivotNew = "new"
+	PivotOld = "old"
+	GlobalCwd = "by-cwd"
 )
 
 var Pivoting bool
@@ -45,8 +45,8 @@ var Config struct {
 	storage string
 	tree bool
 	treeDir string
-	mounts []Mount
-	mountpoints []string
+	root *Tree
+	mountpoints []string // won't need this after tree code is done
 	overlayOpts string
 	quiet bool
 	overlay string
@@ -60,6 +60,8 @@ func optParse(flag, opt string) bool {
 }
 
 func main(){
+	Config.root = new(Tree)
+	Config.root.entries = make(map[string]*Tree)
 	// i am NOT making a decorator function
 	flagOptsCache := make(map[string]*regexp.Regexp)
 	flagOpts := func(flag, opts string, matches... string) bool {
@@ -123,8 +125,7 @@ func main(){
 				if ! b {
 					return
 				}
-				var mount Mount
-				mount.overlay = new(Overlay)
+				mount := new(Overlay)
 				mount.source = os.Args[1]
 				replace := strings.HasPrefix(flag, "-r")
 				if replace {
@@ -135,33 +136,33 @@ func main(){
 					i+=2
 				}
 				if len(argKeys) > 0 {
-					mount.overlay.keys = argKeys
+					mount.keys = argKeys
 					clear(argKeys)
 				} else {
-					mount.overlay.keys = make(Keys)
+					mount.keys = make(Keys)
 					in, out := realpath(mount.source, false), realpath(mount.sink, false)
 					if optParse(flag, ""){ // if opts exist
 						if optParse(flag, "i"){
-							mount.overlay.keys["source"] = in
+							mount.keys["source"] = in
 						}
 						if optParse(flag, "o"){
-							mount.overlay.keys["sink"] = out
+							mount.keys["sink"] = out
 						}
 					} else if replace { // defaults for -r
-						mount.overlay.keys["source"] = in
-						mount.overlay.keys["sink"] = out
+						mount.keys["source"] = in
+						mount.keys["sink"] = out
 					} else { // defaults for -p
-						mount.overlay.keys["sink"] = out
+						mount.keys["sink"] = out
 					}
 				}
 				mount.source = realpath(mount.source, true)
 				mount.sink = realpath(mount.sink, true)
 
-				if argRecurseOpts != nil {
-					mount.recurse = argRecurseOpts
-					argRecurseOpts = nil
-				}
-				Config.mounts = append(Config.mounts, mount)
+				// if argRecurseOpts != nil {
+				// 	mount.recurse = argRecurseOpts
+				// 	argRecurseOpts = nil
+				// }
+				trieAdd(mount.sink, mount, Config.root)
 
 			case flagOpts(flag, "bo", "-R", "-recurse", "-Recurse"):
 				argRecurseOpts = new(RecurseOpts)
@@ -245,16 +246,16 @@ func main(){
 	if err != nil {
 		log(Error, err)
 	}
-	base := Config.storage + "/" + RootBase
+	base := Config.storage + "/" + PivotBase
 	err = mkdir(base)
 	if err != nil {
 		log(Error, err)
 		return
 	}
 	syscall.Mount("tmpfs", base, "tmpfs", 0, "")
-	mkdir(base + "/" + RootOld)
-	mkdir(base + "/" + RootNew)
-	err = syscall.PivotRoot(base, base + "/" + RootOld)
+	mkdir(base + "/" + PivotOld)
+	mkdir(base + "/" + PivotNew)
+	err = syscall.PivotRoot(base, base + "/" + PivotOld)
 	if err != nil {
 		log(Error, err)
 		return
@@ -268,24 +269,19 @@ func main(){
 	Pivoting = true
 
 	// set old root propagation private
-	err = syscall.Mount(RootOld, RootOld, "", syscall.MS_PRIVATE|syscall.MS_REC, "")
+	err = syscall.Mount(PivotOld, PivotOld, "", syscall.MS_PRIVATE|syscall.MS_REC, "")
 	if err != nil {
 		log(Error, err)
 		return
 	}
 	// mount oldroot to newroot
-	syscall.Mount("/" + RootOld, "/" + RootNew, "bind", syscall.MS_BIND|syscall.MS_REC, "")
+	syscall.Mount("/" + PivotOld, "/" + PivotNew, "bind", syscall.MS_BIND|syscall.MS_REC, "")
 
 	// add mounts
-	for _, m := range Config.mounts {
-		err := m.mount()
-		if err != nil {
-			log(Error, "Failed to mount:", err)
-		}
-	}
+	mounter(Config.root)
 
 	// umount /oldroot
-	err = syscall.Unmount(RootOld, syscall.MNT_DETACH)
+	err = syscall.Unmount(PivotOld, syscall.MNT_DETACH)
 	if err != nil {
 		log(Error, err)
 		return
@@ -297,7 +293,7 @@ func main(){
 		return
 	}
 	// cd /newroot
-	err = syscall.Chdir("/" + RootNew)
+	err = syscall.Chdir("/" + PivotNew)
 	if err != nil {
 		log(Error, err)
 		return
@@ -340,29 +336,29 @@ func main(){
 	// all done with overlay setup
 	Pivoting = false
 
-	if Config.tree {
-		if Config.treeDir == "" {
-			Config.treeDir = Config.storage + "/" + Tree
-		}
-		// make tree
-		err := mkdir(Config.treeDir)
-		if err != nil {
-			log(Error, err)
-			return
-		}
-		syscall.Mount("tmpfs", Config.treeDir, "tmpfs", 0, "")
-		syscall.Mount("", Config.treeDir, "", syscall.MS_SLAVE, "")
-		for _, dir := range []string{TreeLower, TreeUpper, TreeOverlay}{
-			err = mkdir(Config.treeDir + "/" + dir)
-			if err != nil {
-				log(Error, err)
-				return
-			}
-		}
-		for _, p := range Config.mounts {
-			treeAdd(p)
-		}
-	}
+	// if Config.tree {
+	// 	if Config.treeDir == "" {
+	// 		Config.treeDir = Config.storage + "/" + BindTree
+	// 	}
+	// 	// make tree
+	// 	err := mkdir(Config.treeDir)
+	// 	if err != nil {
+	// 		log(Error, err)
+	// 		return
+	// 	}
+	// 	syscall.Mount("tmpfs", Config.treeDir, "tmpfs", 0, "")
+	// 	syscall.Mount("", Config.treeDir, "", syscall.MS_SLAVE, "")
+	// 	for _, dir := range []string{TreeLower, TreeUpper, TreeOverlay}{
+	// 		err = mkdir(Config.treeDir + "/" + dir)
+	// 		if err != nil {
+	// 			log(Error, err)
+	// 			return
+	// 		}
+	// 	}
+	// 	for _, p := range Config.mounts {
+	// 		treeAdd(p)
+	// 	}
+	// }
 
 	// unmount everything on exit
 	defer umounter()

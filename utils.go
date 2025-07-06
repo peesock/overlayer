@@ -213,9 +213,9 @@ func unwrapRoot(s, oldornew string) string {
 	if Pivoting {
 		switch oldornew[0] {
 		case 'o':
-			s, _ = strings.CutPrefix(s, "/" + RootOld)
+			s, _ = strings.CutPrefix(s, "/" + PivotOld)
 		case 'n':
-			s, _ = strings.CutPrefix(s, "/" + RootNew)
+			s, _ = strings.CutPrefix(s, "/" + PivotNew)
 		}
 	}
 	return s
@@ -225,9 +225,9 @@ func wrapRoot(s, oldornew string) string {
 	if Pivoting {
 		switch oldornew[0] {
 		case 'o':
-			return filepath.Join("/", RootOld, s)
+			return filepath.Join("/", PivotOld, s)
 		case 'n':
-			return filepath.Join("/", RootNew, s)
+			return filepath.Join("/", PivotNew, s)
 		}
 	}
 	return s
@@ -240,7 +240,7 @@ func setStorage() (string, error) {
 	}
 	hash := sha1.Sum([]byte(dir))
 	out := base64.RawURLEncoding.EncodeToString(hash[:])
-	out = filepath.Join(Config.global, Bycwd, out)
+	out = filepath.Join(Config.global, GlobalCwd, out)
 	_, err = os.Stat(out)
 	if err != nil {
 		if os.IsNotExist(err) {
