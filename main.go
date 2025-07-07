@@ -1,4 +1,5 @@
 package main
+
 // Todo:
 // Optimize -key usage, add key append mode
 // more advanced flag parsing
@@ -19,6 +20,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -125,8 +127,9 @@ func main(){
 				if ! b {
 					return
 				}
-				mount := new(Overlay)
-				mount.source = os.Args[1]
+				mount := Overlay{
+					source: os.Args[1],
+				}
 				replace := strings.HasPrefix(flag, "-r")
 				if replace {
 					mount.sink = mount.source
@@ -158,11 +161,12 @@ func main(){
 				mount.source = realpath(mount.source, true)
 				mount.sink = realpath(mount.sink, true)
 
-				// if argRecurseOpts != nil {
-				// 	mount.recurse = argRecurseOpts
-				// 	argRecurseOpts = nil
-				// }
 				trieAdd(mount.sink, mount, Config.root)
+				if argRecurseOpts != nil {
+					log(Debug, "About to submount")
+					submounter(mount.sink, *argRecurseOpts, Config.root)
+					argRecurseOpts = nil
+				}
 
 			case flagOpts(flag, "bo", "-R", "-recurse", "-Recurse"):
 				argRecurseOpts = new(RecurseOpts)
@@ -278,7 +282,10 @@ func main(){
 	syscall.Mount("/" + PivotOld, "/" + PivotNew, "bind", syscall.MS_BIND|syscall.MS_REC, "")
 
 	// add mounts
-	mounter(Config.root)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	mounter(Config.root, &wg)
+	wg.Wait()
 
 	// umount /oldroot
 	err = syscall.Unmount(PivotOld, syscall.MNT_DETACH)
@@ -361,7 +368,11 @@ func main(){
 	// }
 
 	// unmount everything on exit
-	defer umounter()
+	defer func(){
+		wg.Add(1)
+		umounter(Config.root, &wg)
+		wg.Wait()
+	}()
 
 	// execute
 	cmd.Run()

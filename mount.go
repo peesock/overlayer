@@ -4,11 +4,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 )
 
 type Mount interface {
 	mount() error
+	umount() error
 }
 
 type Keys map[string] string
@@ -27,19 +29,47 @@ type Bind struct {
 }
 
 type Tree struct {
-	recurse *RecurseOpts
 	entries map[string] *Tree
 	mount Mount
-	hasMount bool
 }
 
-func mounter (node *Tree){
-	if node.hasMount {
-		node.mount.mount()
+// requires clean, absolute path
+func trieAdd(dir string, mount Mount, root *Tree){
+	list := strings.Split(dir, "/")
+	if list[1] == "" {
+		root.mount = mount
+		return
+	}
+	node := root
+	list = list[1:]
+	bool := false
+	var nextNode *Tree
+	for _, base := range list {
+		log(Debug, node)
+		nextNode, bool = node.entries[base]
+		if !bool {
+			nextNode = new(Tree)
+			nextNode.entries = make(map[string]*Tree)
+			node.entries[base] = nextNode
+		}
+		node = nextNode
+	}
+	node.mount = mount
+}
+
+func mounter (node *Tree, wg *sync.WaitGroup){
+	defer wg.Done()
+	if node.mount != nil {
+		err := node.mount.mount()
+		if err != nil {
+			log(Error, "Mount error:", err)
+			// mount() throws an error only when it's impossible to continue
+			return
+		}
 	}
 	for _, v := range node.entries {
-		log(Debug, "range found", v)
-		mounter(v)
+		wg.Add(1)
+		go mounter(v, wg)
 	}
 }
 
@@ -50,7 +80,7 @@ func (m Bind) mount() error {
 	}
 	log(User, "Bind mounting:")
 	log(User, m.source, "-->", m.sink)
-	err := mount(m.source, m.sink, "bind", flags, "")
+	err := mount(&m, m.source, m.sink, "bind", flags, "")
 	return err
 }
 
@@ -90,29 +120,8 @@ func (m Overlay) mount() error {
 	"," + Config.overlayOpts
 	log(User, "Mounting overlayfs [index " + strconv.FormatUint(index, 10) + "]:")
 	log(User, m.source, "-->", m.sink)
-	err = mount(m.source, m.sink, "overlay", 0, data)
+	err = mount(&m, m.source, m.sink, "overlay", 0, data)
 	return err
-}
-
-func trieAdd(dir string, mount Mount, root *Tree){
-	node := root
-	currentBase, pending, cut := strings.Cut(dir, "/")
-	if currentBase != "" {
-		panic("dir must be absolute.")
-	}
-	bool := false
-	var nextNode *Tree
-	for cut {
-		currentBase, pending, cut = strings.Cut(pending, "/")
-		nextNode, bool = node.entries[currentBase]
-		if !bool {
-			nextNode = new(Tree)
-			nextNode.entries = make(map[string]*Tree)
-			node.entries[currentBase] = nextNode
-		}
-	}
-	nextNode.mount = mount
-	nextNode.hasMount = true
 }
 
 type RecurseOpts struct {
@@ -120,84 +129,99 @@ type RecurseOpts struct {
 	overlay bool
 }
 
-func mount(source, sink, fstype string, flags uintptr, data string) error {
+func mount(node Mount, source, sink, fstype string, flags uintptr, data string) error {
 	realSource := wrapRoot(source, "old")
 	realSink := wrapRoot(sink, "new")
 	// note for the future: this method makes it impossible to put mounts on top of each other (without multiple overlayer calls).
 	err := syscall.Mount(realSource, realSink, fstype, flags, data)
-	if err == nil {
-		Config.mountpoints = append(Config.mountpoints, sink)
+	if err != nil {
+		node = nil
 	}
 	return err
 }
 
-func umounter(){
-	// for _, v := range parseMountinfo() {log(Debug, v)}
-	for i:=len(Config.mountpoints)-1; i>=0; i-- {
-		mount := wrapRoot(Config.mountpoints[i], "new")
-		log(User, "Unmounting", mount)
-		err := syscall.Unmount(mount, 0)
+func (m Overlay) umount() error {
+	log(User, "Unmounting", m.sink)
+	err := syscall.Unmount(m.sink, 0)
+	if err != nil {
+		log(User, "Unmount:", err, "—", "lazy unmounting...")
+		err = syscall.Unmount(m.sink, syscall.MNT_DETACH)
+	}
+	return err
+}
+
+func (m Bind) umount() error {
+	log(User, "Unmounting", m.sink)
+	err := syscall.Unmount(m.sink, syscall.MNT_DETACH)
+	return err
+}
+
+func umounter(node *Tree, wg *sync.WaitGroup){
+	defer wg.Done()
+	var wg2 sync.WaitGroup
+	for _, v := range node.entries {
+		wg2.Add(1)
+		go umounter(v, &wg2)
+	}
+	wg2.Wait()
+	if node.mount != nil {
+		err := node.mount.umount()
 		if err != nil {
-			log(User, "Unmount:", err, "—", "lazy unmounting...")
-			err = syscall.Unmount(mount, syscall.MNT_DETACH)
-			if err != nil {
-				log(Error, "Could not lazy unmount:", err)
-			}
+			log(Error, "Failed to unmount.")
 		}
 	}
 }
 
-// func submounter(m Tree){
-// 	// chosen function (there will be options later on)
-// 	recurseMounts(m)
-// }
-//
-// func recurseMounts(m Tree) {
-// 	// assume the list is sorted by dir depth for now
-// 	list := parseMountinfo()
-// 	realSink := wrapRoot(m.sink, "new")
-// 	for _, mountpoint := range list {
-// 		if strings.HasPrefix(mountpoint, realSink) && mountpoint != realSink {
-// 			b, err := checkDir(mountpoint, true)
-// 			if err != nil {
-// 				log(Debug, err)
-// 			}
-// 			if ! b {
-// 				log(User, "Mount point", mountpoint, "no longer a directory")
-// 				continue
-// 			}
-// 			m.sink = unwrapRoot(mountpoint, "new")
-// 			m.source = m.sink // this is basically an opinion
-// 			submount(m)
-// 			// if m.recurse.bind {
-// 			// 	return // we have GOT to make the tree for this to work
-// 			// }
-// 		}
-// 	}
-// }
-//
-// // wraps mount objects to make them submounts
-// func submount(m Tree) error {
-// 	recurseOpts := m.recurse
-// 	// *only* the user-specified parent should have recurse, not submounts
-// 	m.recurse = nil
-// 	switch {
-// 	case recurseOpts.overlay:
-// 		m.bind = nil
-// 		m.overlay = new(Overlay)
-// 		keys := make(Keys)
-// 		keys["source"] = m.source
-// 		keys["sink"] = m.sink
-// 		// for now we probably want to differentiate between user-specified and automatic mounts like these
-// 		keys["submount"] = "true"
-// 		m.overlay.keys = keys
-// 	case recurseOpts.bind:
-// 		m.overlay = nil
-// 		m.bind = new(Bind)
-// 		m.bind.recursive = false
-// 	}
-// 	return m.mount()
-// }
+func submounter(dir string, opts RecurseOpts, node *Tree){
+	// chosen function (there will be options later on)
+	list := getSubmounts(dir)
+	for _, v := range list {
+		log(Debug, v)
+		addSubmount(v, opts, node)
+	}
+}
+
+func getSubmounts(dir string) []string {
+	list := parseMountinfo()
+	out := make([]string, 0)
+	for _, mountpoint := range list {
+		if strings.HasPrefix(mountpoint, dir) && mountpoint != dir {
+			_, err := checkDir(mountpoint, true)
+			if err != nil {
+				log(User, "Mount point", mountpoint, "no longer exists")
+				log(Debug, err)
+				continue
+			}
+			out = append(out, mountpoint)
+		}
+	}
+	return out
+}
+
+// wraps mount objects to make them submounts
+func addSubmount(dir string, opts RecurseOpts, node *Tree) {
+	// *only* the user-specified parent should have recurse, not submounts
+	switch {
+	case opts.overlay:
+		mount := Overlay{
+			source: dir,
+			sink: dir,
+			keys: make(Keys),
+		}
+		mount.keys["source"] = mount.source
+		mount.keys["sink"] = mount.sink
+		// for now we probably want to differentiate between user-specified and automatic mounts like these
+		mount.keys["submount"] = "true"
+		trieAdd(dir, mount, node)
+	case opts.bind:
+		mount := Bind{
+			source: dir,
+			sink: dir,
+			recursive: false,
+		}
+		trieAdd(dir, mount, node)
+	}
+}
 
 func (m Overlay) dbgTreeAdd() {
 	log(User, "Adding tree")
@@ -214,7 +238,7 @@ func (m Overlay) dbgTreeAdd() {
 	}
 	for i:=0; i<len(args); i+=2 {
 		mkdir(args[i+1])
-		mount(args[i], args[i+1], "bind", syscall.MS_BIND, "")
+		mount(nil, args[i], args[i+1], "bind", syscall.MS_BIND, "")
 	}
 }
 
