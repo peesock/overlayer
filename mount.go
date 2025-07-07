@@ -8,31 +8,6 @@ import (
 	"syscall"
 )
 
-type Mount interface {
-	mount() error
-	umount() error
-}
-
-type Keys map[string] string
-
-type Overlay struct  {
-	source string
-	sink string
-	keys Keys
-	index uint64
-}
-
-type Bind struct {
-	source string
-	sink string
-	recursive bool
-}
-
-type Tree struct {
-	entries map[string] *Tree
-	mount Mount
-}
-
 // requires clean, absolute path
 func trieAdd(dir string, mount Mount, root *Tree){
 	list := strings.Split(dir, "/")

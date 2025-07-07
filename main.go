@@ -24,36 +24,9 @@ import (
 	"syscall"
 )
 
-// mostly for easy renames
-const (
-	ProgramName = "overlayer"
-	IndexId = "id"
-	IndexData = "data"
-	IndexWork = "work"
-	DbgTree = "tree"
-	DbgTreeUpper = "upper"
-	DbgTreeLower = "lower"
-	DbgTreeOverlay = "overlay"
-	PivotBase = "pivot"
-	PivotNew = "new"
-	PivotOld = "old"
-	GlobalCwd = "by-cwd"
-)
+var Root *Tree
 
 var Pivoting bool
-
-var Config struct {
-	global string
-	storage string
-	tree bool
-	treeDir string
-	root *Tree
-	mountpoints []string // won't need this after tree code is done
-	overlayOpts string
-	quiet bool
-	overlay string
-	debug bool
-}
 
 func optParse(flag, opt string) bool {
 	_, opts, b := strings.Cut(flag, ",")
@@ -62,8 +35,8 @@ func optParse(flag, opt string) bool {
 }
 
 func main(){
-	Config.root = new(Tree)
-	Config.root.entries = make(map[string]*Tree)
+	Root = new(Tree)
+	Root.entries = make(map[string]*Tree)
 	// i am NOT making a decorator function
 	flagOptsCache := make(map[string]*regexp.Regexp)
 	flagOpts := func(flag, opts string, matches... string) bool {
@@ -161,10 +134,10 @@ func main(){
 				mount.source = realpath(mount.source, true)
 				mount.sink = realpath(mount.sink, true)
 
-				trieAdd(mount.sink, mount, Config.root)
+				trieAdd(mount.sink, mount, Root)
 				if argRecurseOpts != nil {
 					log(Debug, "About to submount")
-					submounter(mount.sink, *argRecurseOpts, Config.root)
+					submounter(mount.sink, *argRecurseOpts, Root)
 					argRecurseOpts = nil
 				}
 
@@ -284,7 +257,7 @@ func main(){
 	// add mounts
 	var wg sync.WaitGroup
 	wg.Add(1)
-	mounter(Config.root, &wg)
+	mounter(Root, &wg)
 	wg.Wait()
 
 	// umount /oldroot
@@ -370,7 +343,7 @@ func main(){
 	// unmount everything on exit
 	defer func(){
 		wg.Add(1)
-		umounter(Config.root, &wg)
+		umounter(Root, &wg)
 		wg.Wait()
 	}()
 
