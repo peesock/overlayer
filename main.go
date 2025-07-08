@@ -7,10 +7,8 @@ package main
 // Compile the regex in getIndex
 // Fuser for umounter
 // Code documentation
-// Work on different submounting methods
+// Different submounting methods
 // Add dedupe?
-// put all pivot_rootable functions in a big old object or something idk
-// make the Trie (pronounced tree-eh)
 
 // #include "cmp.h"
 import "C"
@@ -24,7 +22,8 @@ import (
 	"syscall"
 )
 
-var Root *Tree
+var SourceRoot *TreeSource
+var SinkRoot *TreeSink
 
 var Pivoting bool
 
@@ -35,8 +34,10 @@ func optParse(flag, opt string) bool {
 }
 
 func main(){
-	Root = new(Tree)
-	Root.entries = make(map[string]*Tree)
+	SourceRoot = new(TreeSource)
+	SourceRoot.entries = make(map[string]*TreeSource)
+	SinkRoot = new(TreeSink)
+	SinkRoot.entries = make(map[string]*TreeSink)
 	// i am NOT making a decorator function
 	flagOptsCache := make(map[string]*regexp.Regexp)
 	flagOpts := func(flag, opts string, matches... string) bool {
@@ -96,19 +97,19 @@ func main(){
 		default:
 			switch {
 			case flagOpts(flag, "io", "-p", "-place", "-r", "-replace"):
-				b, _ := checkDir(os.Args[1], false)
+				source := os.Args[1]
+				sink := ""
+				b, _ := checkDir(source, false)
 				if ! b {
 					return
 				}
-				mount := Overlay{
-					source: os.Args[1],
-				}
+				mount := Overlay{ }
 				replace := strings.HasPrefix(flag, "-r")
 				if replace {
-					mount.sink = mount.source
+					sink = source
 					i++
 				} else {
-					mount.sink = os.Args[2]
+					sink = os.Args[2]
 					i+=2
 				}
 				if len(argKeys) > 0 {
@@ -116,7 +117,7 @@ func main(){
 					clear(argKeys)
 				} else {
 					mount.keys = make(Keys)
-					in, out := realpath(mount.source, false), realpath(mount.sink, false)
+					in, out := realpath(source, false), realpath(sink, false)
 					if optParse(flag, ""){ // if opts exist
 						if optParse(flag, "i"){
 							mount.keys["source"] = in
@@ -131,13 +132,12 @@ func main(){
 						mount.keys["sink"] = out
 					}
 				}
-				mount.source = realpath(mount.source, true)
-				mount.sink = realpath(mount.sink, true)
+				source = realpath(source, true)
+				sink = realpath(sink, true)
 
-				trieAdd(mount.sink, mount, Root)
+				trieAdd(source, sink, &mount)
 				if argRecurseOpts != nil {
-					log(Debug, "About to submount")
-					submounter(mount.sink, *argRecurseOpts, Root)
+					submounter(sink, *argRecurseOpts)
 					argRecurseOpts = nil
 				}
 
@@ -257,7 +257,7 @@ func main(){
 	// add mounts
 	var wg sync.WaitGroup
 	wg.Add(1)
-	mounter(Root, &wg)
+	mounter(SinkRoot, &wg)
 	wg.Wait()
 
 	// umount /oldroot
@@ -343,7 +343,7 @@ func main(){
 	// unmount everything on exit
 	defer func(){
 		wg.Add(1)
-		umounter(Root, &wg)
+		umounter(SinkRoot, &wg)
 		wg.Wait()
 	}()
 

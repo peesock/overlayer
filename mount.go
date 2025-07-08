@@ -1,41 +1,65 @@
 package main
 
 import (
-	"path/filepath"
+	// "path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 )
 
+func (node *TreeSink) getDir() string {
+	path, node := node.name, node.parent
+	for node != nil {
+		path = node.name + "/" + path
+		node = node.parent
+	}
+	return path
+}
+func (node *TreeSource) getDir() string {
+	path, node := node.name, node.parent
+	for node != nil {
+		path = node.name + "/" + path
+		node = node.parent
+	}
+	return path
+}
+
+func trieAdd(source, sink string, mount Mount){
+	_trieAdd(source, SourceRoot, mount)
+	_trieAdd(sink, SinkRoot, mount)
+}
+
+func _trieAdd(dir string, node TreeInter, mount Mount){
 // requires clean, absolute path
-func trieAdd(dir string, mount Mount, root *Tree){
 	list := strings.Split(dir, "/")
 	if list[1] == "" {
-		root.mount = mount
+		SinkRoot.mnt = mount
 		return
 	}
-	node := root
 	list = list[1:]
 	bool := false
-	var nextNode *Tree
+	var nextNode TreeInter
 	for _, base := range list {
-		log(Debug, node)
-		nextNode, bool = node.entries[base]
+		nextNode, bool = node.getEntry(base)
 		if !bool {
-			nextNode = new(Tree)
-			nextNode.entries = make(map[string]*Tree)
-			node.entries[base] = nextNode
+			nextNode = node.new()
+			nextNode.setData(base, node)
+			node.setEntry(base, nextNode)
 		}
 		node = nextNode
 	}
-	node.mount = mount
+	switch n := node.(type) {
+	case *TreeSource:
+		mount.setSource(n)
+	}
+	node.setMount(mount)
 }
 
-func mounter (node *Tree, wg *sync.WaitGroup){
+func mounter (node *TreeSink, wg *sync.WaitGroup){
 	defer wg.Done()
-	if node.mount != nil {
-		err := node.mount.mount()
+	if node.mnt != nil {
+		err := node.mnt.mount(node.getDir())
 		if err != nil {
 			log(Error, "Mount error:", err)
 			// mount() throws an error only when it's impossible to continue
@@ -48,19 +72,32 @@ func mounter (node *Tree, wg *sync.WaitGroup){
 	}
 }
 
-func (m Bind) mount() error {
+func mount(node Mount, source, sink, fstype string, flags uintptr, data string) error {
+	realSource := wrapRoot(source, "old")
+	realSink := wrapRoot(sink, "new")
+	// note for the future: this method makes it impossible to put mounts on top of each other (without multiple overlayer calls).
+	err := syscall.Mount(realSource, realSink, fstype, flags, data)
+	if err != nil {
+		node = nil
+	}
+	return err
+}
+
+func (m Bind) mount(sink string) error {
+	source := m.sourceNode.getDir()
 	flags := uintptr(syscall.MS_BIND)
 	if m.recursive {
 		flags |= syscall.MS_REC
 	}
 	log(User, "Bind mounting:")
-	log(User, m.source, "-->", m.sink)
-	err := mount(&m, m.source, m.sink, "bind", flags, "")
+	log(User, source, "-->", sink)
+	err := mount(&m, source, sink, "bind", flags, "")
 	return err
 }
 
-func (m Overlay) mount() error {
+func (m Overlay) mount(sink string) error {
 	var err error
+	source := m.sourceNode.getDir()
 	// check if it's even worth trying
 	// if syscall.Mount(wrapRoot(m.source, "old"), wrapRoot(m.sink, "new"), "", syscall.MS_BIND, "") != nil {
 	// 	log(User, "Overlay failed, bind mounting...")
@@ -89,49 +126,17 @@ func (m Overlay) mount() error {
 	// mount overlay
 	indexPath := wrapRoot(escapeOverlayOpts(Config.storage), "old") + "/" + strconv.FormatUint(m.index, 10)
 	data :=
-	"lowerdir=" + escapeOverlayOpts(wrapRoot(m.source, "old")) +
+	"lowerdir=" + escapeOverlayOpts(wrapRoot(source, "old")) +
 	",upperdir=" + indexPath + "/" + IndexData +
 	",workdir=" + indexPath + "/" + IndexWork +
 	"," + Config.overlayOpts
 	log(User, "Mounting overlayfs [index " + strconv.FormatUint(index, 10) + "]:")
-	log(User, m.source, "-->", m.sink)
-	err = mount(&m, m.source, m.sink, "overlay", 0, data)
+	log(User, source, "-->", sink)
+	err = mount(&m, source, sink, "overlay", 0, data)
 	return err
 }
 
-type RecurseOpts struct {
-	bind bool
-	overlay bool
-}
-
-func mount(node Mount, source, sink, fstype string, flags uintptr, data string) error {
-	realSource := wrapRoot(source, "old")
-	realSink := wrapRoot(sink, "new")
-	// note for the future: this method makes it impossible to put mounts on top of each other (without multiple overlayer calls).
-	err := syscall.Mount(realSource, realSink, fstype, flags, data)
-	if err != nil {
-		node = nil
-	}
-	return err
-}
-
-func (m Overlay) umount() error {
-	log(User, "Unmounting", m.sink)
-	err := syscall.Unmount(m.sink, 0)
-	if err != nil {
-		log(User, "Unmount:", err, "—", "lazy unmounting...")
-		err = syscall.Unmount(m.sink, syscall.MNT_DETACH)
-	}
-	return err
-}
-
-func (m Bind) umount() error {
-	log(User, "Unmounting", m.sink)
-	err := syscall.Unmount(m.sink, syscall.MNT_DETACH)
-	return err
-}
-
-func umounter(node *Tree, wg *sync.WaitGroup){
+func umounter(node *TreeSink, wg *sync.WaitGroup){
 	defer wg.Done()
 	var wg2 sync.WaitGroup
 	for _, v := range node.entries {
@@ -139,20 +144,37 @@ func umounter(node *Tree, wg *sync.WaitGroup){
 		go umounter(v, &wg2)
 	}
 	wg2.Wait()
-	if node.mount != nil {
-		err := node.mount.umount()
+	if node.mnt != nil {
+		err := node.mnt.umount(node.getDir())
 		if err != nil {
 			log(Error, "Failed to unmount.")
 		}
 	}
 }
 
-func submounter(dir string, opts RecurseOpts, node *Tree){
+func (m Overlay) umount(sink string) error {
+	log(User, "Unmounting", sink)
+	err := syscall.Unmount(sink, 0)
+	if err != nil {
+		log(User, "Unmount:", err, "—", "lazy unmounting...")
+		err = syscall.Unmount(sink, syscall.MNT_DETACH)
+	}
+	return err
+}
+
+func (m Bind) umount(sink string) error {
+	log(User, "Unmounting", sink)
+	err := syscall.Unmount(sink, syscall.MNT_DETACH)
+	return err
+}
+
+func submounter(dir string, opts RecurseOpts){
+	log(Debug, "Submounting")
 	// chosen function (there will be options later on)
 	list := getSubmounts(dir)
 	for _, v := range list {
 		log(Debug, v)
-		addSubmount(v, opts, node)
+		addSubmount(v, opts)
 	}
 }
 
@@ -174,48 +196,44 @@ func getSubmounts(dir string) []string {
 }
 
 // wraps mount objects to make them submounts
-func addSubmount(dir string, opts RecurseOpts, node *Tree) {
+func addSubmount(dir string, opts RecurseOpts) {
 	// *only* the user-specified parent should have recurse, not submounts
 	switch {
 	case opts.overlay:
 		mount := Overlay{
-			source: dir,
-			sink: dir,
 			keys: make(Keys),
 		}
-		mount.keys["source"] = mount.source
-		mount.keys["sink"] = mount.sink
+		mount.keys["source"] = dir
+		mount.keys["sink"] = dir
 		// for now we probably want to differentiate between user-specified and automatic mounts like these
 		mount.keys["submount"] = "true"
-		trieAdd(dir, mount, node)
+		trieAdd(dir, dir, &mount)
 	case opts.bind:
 		mount := Bind{
-			source: dir,
-			sink: dir,
 			recursive: false,
 		}
-		trieAdd(dir, mount, node)
+		trieAdd(dir, dir, &mount)
 	}
 }
 
-func (m Overlay) dbgTreeAdd() {
-	log(User, "Adding tree")
-	args := []string{
-		// lower
-		m.source,
-		filepath.Join(Config.treeDir, DbgTreeLower, m.sink),
-		// upper
-		filepath.Join(Config.storage, strconv.FormatUint(m.index, 10), IndexData),
-		filepath.Join(Config.treeDir, DbgTreeUpper, m.sink),
-		// overlay
-		m.sink,
-		filepath.Join(Config.treeDir, DbgTreeOverlay, m.sink),
-	}
-	for i:=0; i<len(args); i+=2 {
-		mkdir(args[i+1])
-		mount(nil, args[i], args[i+1], "bind", syscall.MS_BIND, "")
-	}
-}
+// func (m Overlay) dbgTreeAdd() {
+// 	log(User, "Adding tree")
+// 	args := []string{
+// 		// lower
+// 		m.source,
+// 		filepath.Join(Config.treeDir, DbgTreeLower, m.sink),
+// 		// upper
+// 		filepath.Join(Config.storage, strconv.FormatUint(m.index, 10), IndexData),
+// 		filepath.Join(Config.treeDir, DbgTreeUpper, m.sink),
+// 		// overlay
+// 		m.sink,
+// 		filepath.Join(Config.treeDir, DbgTreeOverlay, m.sink),
+// 	}
+// 	for i:=0; i<len(args); i+=2 {
+// 		mkdir(args[i+1])
+// 		mount(nil, args[i], args[i+1], "bind", syscall.MS_BIND, "")
+// 	}
+// }
 
 // func recurseFiles(dir string, data *syscall.Stat_t, opts *RecurseOpts) {
 // 	if data == nil {
