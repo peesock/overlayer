@@ -1,5 +1,8 @@
 package main
 
+// #include "cmp.h"
+// #cgo nocallback cmp
+import "C"
 import (
 	"crypto/sha1"
 	"encoding/base64"
@@ -10,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type LogMode byte
@@ -42,6 +46,44 @@ func log(mode LogMode, args... any){
 			ProgramName + "[" + msg + "]: " + file + ":" + strconv.Itoa(line) + ":",
 		}, args...)...)
 	}
+}
+
+func dedupe(upperdir, lowerdir string) error {
+	uppers, err := os.ReadDir(upperdir)
+	if err != nil {
+		return err
+	}
+	var wg sync.WaitGroup
+	var uppath, lowpath string
+	for _, up := range uppers {
+		name := up.Name()
+		uppath, lowpath = upperdir + "/" + name, lowerdir + "/" + name
+		if up.IsDir() {
+			log(Debug, "going down", uppath)
+			wg.Add(1)
+			go func(up, low string){
+				defer wg.Done()
+				dedupe(up, low)
+			}(uppath, lowpath)
+			continue
+		}
+		wg.Add(1)
+		go func(up, low string){
+			defer wg.Done()
+			log(Debug, "goroutine", up)
+			log(Debug, up, low)
+			v, err := C.cmp(C.CString(up), C.CString(low))
+			if v == 0 || v == 2 {
+				log(User, "Pretending to delete file", up)
+			} else if err != nil {
+				log(Error, err)
+			}
+			log(Debug, "done", up)
+		}(uppath, lowpath)
+	}
+	wg.Wait()
+	log(Debug, "done waiting")
+	return nil
 }
 
 func makeIndex(index uint64, keys Keys) (error) {

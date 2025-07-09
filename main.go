@@ -8,7 +8,8 @@ package main
 // Fuser for umounter
 // Code documentation
 // Different submounting methods
-// Add dedupe?
+// limit dedupe's thread count, prioritize larger files
+// Use slog :(
 
 // #include "cmp.h"
 import "C"
@@ -62,9 +63,11 @@ func main(){
 		flag := os.Args[0]
 		switch flag {
 		case "-test":
-			// #cgo nocallback cmp
 			val, err := C.cmp(C.CString(os.Args[1]), C.CString(os.Args[2]))
 			log(User, val, err);
+			return
+		case "-test2":
+			dedupe(os.Args[1], os.Args[2])
 			return
 		case "-d", "-debug":
 			Config.debug = true
